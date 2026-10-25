@@ -1,0 +1,8 @@
+# dsh-sidebar bundle patch: mount the Host half in the profile.
+#
+# The Web half registers right-Sidebar extension points through package.json
+# `dsh.client`; this row is the bundle's stable mount point. No shipped row is
+# disabled or overridden.
+- insert:
+    - id: dsh-sidebar
+      name: '@local/dsh-sidebar'

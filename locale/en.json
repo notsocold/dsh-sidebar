@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Sidebar",
+    "description": "A Claude Desktop-style right Sidebar: progress, working-directory tree, terminal section, skills and memory; no tabs or fullscreen, right-side X closes wide pages; starts closed, preserves open/closed across session switches, and cleans stale persisted expanded states."
+  }
+}
