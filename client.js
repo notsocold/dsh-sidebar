@@ -10,7 +10,9 @@
  *    directory (native-style lazy tree; files open the native text preview),
  *    Terminal (one "new terminal" action) and Context (skill usage and memory).
  *    All four are same-level collapsible sections; working directory and
- *    terminal default to open.
+ *    terminal default to open. Context memory lists only the topics this same
+ *    Session created or last changed, and follows the memory change stream
+ *    while the section is open.
  * 3. The narrow session column has a fixed width: the outer resize handle is
  *    hidden while this page is active, and overflow text in task/skill/memory/
  *    file rows is ellipsized with the full value available on hover.
@@ -63,6 +65,8 @@ window.__ModuleLoader__.load({
     const NARROW_WIDTH_RATIO = 0.3
     const WIDE_WIDTH_RATIO = 0.45
     const MEMORY_LIMIT = 4
+    const MEMORY_EVENTS_PATH = '/api/dsh-memory/events'
+    const MEMORY_EVENT_DEBOUNCE_MS = 500
     const SKILL_USAGE_LIMIT = 3
     const FILE_ENTRY_LIMIT = 200
     const SECTION_STORAGE_PREFIX = 'dsh-sidebar:sections:'
@@ -104,6 +108,7 @@ window.__ModuleLoader__.load({
       'status.in_progress': '进行中',
       'status.completed': '已完成',
       'context.memory': '记忆',
+      'context.memory.empty': '本会话暂无记忆',
       'context.skills': '技能',
       'skills.empty': '本会话尚未使用技能',
       'terminal.new': '新建终端',
@@ -134,6 +139,7 @@ window.__ModuleLoader__.load({
       'status.in_progress': 'In progress',
       'status.completed': 'Completed',
       'context.memory': 'Memory',
+      'context.memory.empty': 'No memories from this session yet',
       'context.skills': 'Skills',
       'skills.empty': 'No skills used in this conversation',
       'terminal.new': 'New terminal',
@@ -993,7 +999,8 @@ window.__ModuleLoader__.load({
   line-height: 18px;
   font-variant-numeric: tabular-nums;
 }
-.dsh-sidebar-skill-empty {
+.dsh-sidebar-skill-empty,
+.dsh-sidebar-memory-empty {
   padding: 3px 8px;
   font-size: 11px;
   color: var(--dsw-alias-label-secondary);
@@ -1810,16 +1817,24 @@ body:has([data-sidebar-right-session] [data-dockkit-tab][aria-selected='true'] .
     }
 
     /**
-     * Pick at most a few memories relevant to this conversation's project.
+     * Pick the topics this conversation created or last changed.
+     *
+     * A topic's `source.sessionId` is rewritten on every write (the automatic
+     * extractor and the memory tool both pass the writing Session), so it
+     * identifies the last Session that produced or modified the topic. Topics
+     * last written by another Session, or without provenance, stay out.
      * @param {{ memories: any[], projectKey: string } | undefined} payload - normalized memory payload.
+     * @param {string} sessionId - mounted Session id.
      * @returns {any[]} pinned first, then freshest.
      */
-    function pickMemories(payload) {
+    function pickMemories(payload, sessionId) {
       if (payload === undefined) return []
       const projectKey = payload.projectKey
       const rows = payload.memories.filter(memory => {
         if (memory === null || typeof memory !== 'object') return false
         if (memory.status === 'archived') return false
+        const source = memory.source
+        if (source === null || typeof source !== 'object' || source.sessionId !== sessionId) return false
         if (memory.scope === 'project' && (projectKey === '' || memory.projectKey !== projectKey)) return false
         return true
       })
@@ -1849,17 +1864,75 @@ body:has([data-sidebar-right-session] [data-dockkit-tab][aria-selected='true'] .
       const [skillCatalog, setSkillCatalog] = React.useState(undefined)
 
       React.useEffect(() => {
+        // The section body is hidden while collapsed; fetch and subscribe only
+        // while it is visible, so a closed panel costs no requests and keeps
+        // no event stream open.
+        if (!props.open) return undefined
         const controller = new AbortController()
         let alive = true
-        setPayload(undefined)
-        fetchMemories(props.sessionId, controller.signal).then(value => {
-          if (alive) setPayload(value)
-        })
+        /** @type {ReturnType<typeof setTimeout> | null} */
+        let pending = null
+        /**
+         * Fetch this Session's memory view. A failed refresh keeps the last
+         * good payload; the initial load (and every Session switch) clears it.
+         * @param {boolean} initial - whether this is the effect's first load.
+         */
+        const load = initial => {
+          if (initial) setPayload(undefined)
+          fetchMemories(props.sessionId, controller.signal).then(value => {
+            if (!alive) return
+            if (value === undefined && !initial) return
+            setPayload(value)
+          })
+        }
+        /** Coalesce bursts of store changes into one state refetch. */
+        const scheduleLoad = () => {
+          if (pending !== null) clearTimeout(pending)
+          pending = setTimeout(() => {
+            pending = null
+            if (alive) load(false)
+          }, MEMORY_EVENT_DEBOUNCE_MS)
+        }
+        load(true)
+        // dsh-memory writes topics asynchronously (after the conversation goes
+        // quiet), and a write may fan out into several store events. The change
+        // stream replaces a timer: fetch only when the library actually
+        // changes. EventSource reconnects on its own, and a reconnect refetches
+        // to pick up anything written while the stream was down.
+        /** @type {EventSource | null} */
+        let source = null
+        try {
+          source = new EventSource(MEMORY_EVENTS_PATH)
+          let opened = false
+          source.onopen = () => {
+            if (opened) scheduleLoad()
+            opened = true
+          }
+          source.onmessage = () => { scheduleLoad() }
+          source.onerror = () => {
+            // An older dsh-memory has no events route and fails for good; the
+            // bar then still refreshes on Session switches and section reopens.
+            if (source !== null && source.readyState === EventSource.CLOSED) {
+              source.close()
+              source = null
+            }
+          }
+        } catch {
+          source = null
+        }
+        /** Refetch once when the page becomes visible after being hidden. */
+        const onVisibility = () => {
+          if (typeof document !== 'undefined' && document.visibilityState === 'visible') scheduleLoad()
+        }
+        if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility)
         return () => {
           alive = false
           controller.abort()
+          if (pending !== null) clearTimeout(pending)
+          if (source !== null) source.close()
+          if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility)
         }
-      }, [props.sessionId])
+      }, [props.sessionId, props.open])
 
       React.useEffect(() => {
         const controller = new AbortController()
@@ -1888,7 +1961,7 @@ body:has([data-sidebar-right-session] [data-dockkit-tab][aria-selected='true'] .
         }
       }, [props.sessionId])
 
-      const memories = pickMemories(payload)
+      const memories = pickMemories(payload, props.sessionId)
       const usage = readSkillUsage(props.skillUsage)
       const merged = usage === undefined
         ? undefined
@@ -1911,20 +1984,25 @@ body:has([data-sidebar-right-session] [data-dockkit-tab][aria-selected='true'] .
         children.push(h('div', { key: 'skills', className: 'dsh-sidebar-group' }, skillChildren))
       }
 
-      if (memories.length > 0) {
-        const rows = memories.map((memory, index) => {
-          const scope = typeof memory.scopeLabel === 'string' ? memory.scopeLabel : String(memory.scope || '')
-          const title = (memory.pinned === true ? '★ ' : '') + (typeof memory.title === 'string' ? memory.title : '')
-          return h('div', {
-            key: typeof memory.id === 'string' ? memory.id : 'memory-' + index,
-            className: 'dsh-sidebar-memory-row',
-          },
-          scope === '' ? null : h('span', { className: 'dsh-sidebar-memory-scope' }, scope),
-          h('span', { className: 'dsh-sidebar-memory-title', title }, title))
-        })
-        children.push(h('div', { key: 'memory', className: 'dsh-sidebar-group' },
-          h('div', { className: 'dsh-sidebar-group-label' }, t('context.memory')),
-          rows))
+      if (payload !== undefined) {
+        const memoryChildren = [
+          h('div', { key: 'label', className: 'dsh-sidebar-group-label' }, t('context.memory')),
+        ]
+        if (memories.length > 0) {
+          memories.forEach((memory, index) => {
+            const scope = typeof memory.scopeLabel === 'string' ? memory.scopeLabel : String(memory.scope || '')
+            const title = (memory.pinned === true ? '★ ' : '') + (typeof memory.title === 'string' ? memory.title : '')
+            memoryChildren.push(h('div', {
+              key: typeof memory.id === 'string' ? memory.id : 'memory-' + index,
+              className: 'dsh-sidebar-memory-row',
+            },
+            scope === '' ? null : h('span', { className: 'dsh-sidebar-memory-scope' }, scope),
+            h('span', { className: 'dsh-sidebar-memory-title', title }, title)))
+          })
+        } else {
+          memoryChildren.push(h('div', { key: 'empty', className: 'dsh-sidebar-memory-empty' }, t('context.memory.empty')))
+        }
+        children.push(h('div', { key: 'memory', className: 'dsh-sidebar-group' }, memoryChildren))
       }
       return h(Section, {
         t,

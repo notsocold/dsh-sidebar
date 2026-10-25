@@ -20,7 +20,7 @@ Claude Desktop 风格的 DeepSeek Harness 右侧栏增强插件（纯插件，�
 - **工作目录**：与「进度」同级的可折叠分区，**默认展开**；文件样式按原生 Files 树重绘（目录优先、18px 层级缩进、5×10px 行、文件夹/文件图标、行 hover、名称省略）；点击文件直接打开原生文本预览，不再有右侧「在文件树中打开」按钮。
 - **上下文**：
   - **技能**：本会话 skill 工具调用与显式 `/技能名` 使用统计（用会话技能目录过滤普通 slash 命令）。只显示用过的技能行和次数，没有「本会话 N 次 · M 个技能」摘要，也没有「仅统计模型工具调用」提示；
-  - **记忆**：已安装 `dsh-memory` 插件的相关主题；**去掉记忆 icon**，scope 标签（全局/项目）保留在行首；
+  - **记忆**：只显示**本会话创建或最后更新过**的主题（按 dsh-memory 列表项的 `source.sessionId` 匹配，跨会话写入的旧主题不出现），最多 4 条；上下文分区展开期间订阅 dsh-memory 的 `/api/dsh-memory/events` 变更事件，只有记忆库真的变化才重取（500ms 合并），平时不轮询；异步抽取产生的新主题保存后约 1 秒内出现，无需切换会话；无记忆时显示「本会话暂无记忆」；**去掉记忆 icon**，scope 标签保留在行首；
   - 技能行和记忆行都有整行 hover 反馈，hover 背景在分组卡片底色上进一步加深（`color-mix(..., black)`）。
 - **任务数据不依赖 `todos` 投影**：`todos` 是 standing plan，下一轮 `turn/start` 会清空它。Host 半的 `dshSidebarTasks` 投影只保留当前会话最近一次非空 `todo/write`，永不被后续轮次清空；只显示当前会话，fork 前缀不计。
 - **Skill 使用统计**：Host 半的 `dshSidebarSkillUsage` 投影折叠 `tool/call`（`name: 'skill'`）与用户首行 `/<name>` 手势；Client 用 `remote.skills.list` 过滤真正的用户可调用技能。DSH 没有原生统计 API，这是会话事件派生统计。
@@ -37,7 +37,7 @@ Claude Desktop 风格的 DeepSeek Harness 右侧栏增强插件（纯插件，�
   - 座位标准 prop `useProjection('dshSidebarTasks')` / `useProjection('dshSidebarSkillUsage')` 读当前会话。
   - 工作目录树通过 `ctx.remote.workspaceFiles.list(sessionId, path, signal)` 懒加载；根传当前 cwd（或 `.`）；点击文件用 `dsh-resource://file/session/<id>/<相对路径>` 打开原生文本预览。
   - 技能目录通过 `ctx.remote.skills.list({ sessionId }, signal)` 读取。
-  - 记忆主题读取 `/api/dsh-memory/state`；不可用时自动省略。
+  - 记忆主题读取 `/api/dsh-memory/state`，用列表项的 `source.sessionId` 只保留本会话创建或最后修改的主题；上下文分区展开时订阅 `/api/dsh-memory/events` 变更流，收到事件后 500ms 合并刷新；不可用时自动省略。
   - 侧栏开关注册在 `conversation.session.header.utilities`（order 110）；文件预览 X 注册在 `sidebar.right.tab.document.actions`；终端 X 由 `NativePageCloseOverlay` 通过 `ReactDOM.createPortal` 渲染到右侧栏面板右上角；其它非文件宽栏页的 X 在 header utilities（order 120）。所有 X 只关闭宽栏页，永不关闭侧栏。
   - 终端分区使用 `ctx.sidebarRight.openTab('terminal')`，打开前加宽并记录父 tab。
   - 侧栏开关状态：订阅 `ctx.sidebarRight.mounted`，首次挂载强制关闭；之后切换会话按上一个会话最后记录的开关状态应用（关闭仍关闭、打开仍打开），打开时用 `openTab(PAGE_KIND)` 落到本插件会话页。
@@ -69,7 +69,7 @@ DSH 的原生文件树是 `ui-sidebar-files` 注册的独立页签 body，**纯�
 7. 「工作目录」与「进度」同级、默认展开；文件树按原生样式显示，点击文件打开原生预览；没有「在文件树中打开」按钮。
 8. 打开文件/终端时侧栏直接是宽栏，不出现先窄后宽。
 9. 「技能」只显示技能行和次数，没有汇总句或「仅统计模型工具调用」；每行 hover 背景明显加深。
-10. 「记忆」没有 icon，scope 标签在行首；每行 hover 背景明显加深。
+10. 「记忆」只显示本会话创建或最后修改的主题；无记忆时显示「本会话暂无记忆」；面板展开后新保存的记忆保存后约 1 秒内出现，无需切换会话；没有 icon，scope 标签在行首；每行 hover 背景明显加深；
 11. 输入框上方不再出现原生任务条；草稿纸不存在。
 
 ## 文件结构
@@ -89,5 +89,5 @@ DSH 的原生文件树是 `ui-sidebar-files` 注册的独立页签 body，**纯�
 - 标签条隐藏、固定窄栏手柄隐藏、X/侧栏按钮依赖 dockkit 的稳定 `data-*` 锚点；升级 DSH 时若锚点变化，最坏情况是标签条/handle 重新出现，不影响原生功能。
 - 宽度设置使用 layout 控制器的内部 `panels.setRightbar`（无公开宽度 API）；缺失时只降级宽度行为。
 - 技能统计从会话事件派生，不是原生统计 API；手势只有取得技能目录时才计入。
-- 记忆分组依赖本地 `dsh-memory` 插件；未安装时省略。
+- 记忆分组依赖本地 `dsh-memory` 插件；未安装时省略。归属会话取列表项的 `source.sessionId`（最后一次写入该主题的会话）：一个主题被后来的会话改写后会从旧会话的记忆栏消失，在设置页手工改写不会改变归属会话。实时刷新依赖 dsh-memory 的 `/api/dsh-memory/events` 变更流；旧版没有该路由时只在切换会话、重开分区或页面重新可见时刷新。
 - 不改 deepseek-harness 源码、不禁用任何原生插件行。
