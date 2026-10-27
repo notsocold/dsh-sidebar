@@ -18,8 +18,14 @@
  *    file rows is ellipsized with the full value available on hover.
  * 4. Wide pages close with an X that never collapses the Sidebar: file previews
  *    put it at the far right of the reload row, the terminal gets a floating X
- *    at the page's top-right, and other native pages use the header X. The
- *    Sidebar itself is opened/closed only by the sidebar toggle.
+ *    at the page's top-right, and other native pages use the header X. A file
+ *    preview that cannot be read (the file is gone, or its workspace is
+ *    unknown) renders no reload row, so the floating X stands in there too —
+ *    without it the tab would have no close route and would return whenever a
+ *    neighbouring preview closed. Closing a page this plugin did not open falls
+ *    back to the session page, so the dockkit neighbour rule can never land on
+ *    such an unreadable preview. The Sidebar itself is opened/closed only by
+ *    the sidebar toggle.
  * 5. The Sidebar starts closed on load. Its open/closed state is preserved
  *    across Session switches: closed stays closed, open stays open. Opening on
  *    a switch activates this plugin's session page. Nothing auto-opens the
@@ -405,6 +411,24 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Whether the floating close overlay should stand over the active native
+     * page. The document toolbar owns the X for a readable file preview; a
+     * preview whose file cannot be read — gone, or its workspace unknown —
+     * renders no reload row, so its X never mounts and the tab would have no
+     * close route at all. Terminal keeps its floating X, and every other kind
+     * is closed by the header X.
+     * @param {string | undefined} kind - active tab kind.
+     * @param {boolean} hasDocumentClose - whether the mounted preview toolbar
+     *   already holds its X.
+     * @returns {boolean} true when the overlay should render.
+     */
+    function nativeCloseOverlayFor(kind, hasDocumentClose) {
+      if (kind === 'terminal') return true
+      if (kind === 'text') return !hasDocumentClose
+      return false
+    }
+
+    /**
      * Narrow column width for the context panel.
      * @param {number} viewport - frame width in px.
      * @returns {number} width in px.
@@ -563,9 +587,12 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Floating X over a native wide page that has no document toolbar row
-     * (terminal and other non-document pages). It is portaled into the right
-     * panel so it sits at the page's right edge; it closes only that wide tab.
+     * Floating X over a native wide page that has no visible close control of
+     * its own: the terminal, and a file preview that could not read its file
+     * (no document toolbar, so its toolbar X never mounts). It is portaled
+     * into the right panel so it sits at the page's right edge; it closes only
+     * that wide tab. A readable preview keeps its toolbar X, so the overlay
+     * waits for the page to settle and then stays out of the way.
      * @param {{ t: Function, readActive: Function, closeTab: Function }} props - locale and faces.
      * @returns {import('react').ReactNode} portal or null.
      */
@@ -574,12 +601,28 @@ window.__ModuleLoader__.load({
       const [state, setState] = React.useState({ target: null, show: false })
       const latest = React.useRef(props)
       latest.current = props
+      // A preview's toolbar X arrives once the file's Host path is known; the
+      // overlay waits briefly so a normal open never flashes a second X.
+      const settledAt = React.useRef(0)
 
       React.useEffect(() => {
         const update = () => {
           const target = document.querySelector('[data-sidebar-right-session][data-sidebar-right-open]')
           const active = latest.current.readActive()
-          const show = target !== null && active !== undefined && active.kind === 'terminal'
+          let show = false
+          if (target !== null && active !== undefined) {
+            const hasDocumentClose = target.querySelector('.dsh-sidebar-document-close') !== null
+            const wanted = nativeCloseOverlayFor(active.kind, hasDocumentClose)
+            if (wanted && active.kind === 'text') {
+              if (settledAt.current === 0) settledAt.current = Date.now()
+              show = Date.now() - settledAt.current >= 500
+            } else {
+              settledAt.current = 0
+              show = wanted
+            }
+          } else {
+            settledAt.current = 0
+          }
           setState(previous => (
             previous.target === target && previous.show === show
               ? previous
@@ -602,7 +645,7 @@ window.__ModuleLoader__.load({
             try {
               latest.current.closeTab()
             } catch {
-              // The terminal tab may already be gone.
+              // The terminal or preview tab may already be gone.
             }
           },
         }, h(CloseGlyph)),
@@ -2195,13 +2238,17 @@ body:has([data-sidebar-right-session] [data-dockkit-tab][aria-selected='true'] .
 
     /**
      * Remember the page a plugin-initiated open leaves behind, so X can return
-     * to it explicitly instead of relying on dockkit's neighbour choice.
+     * to it explicitly instead of relying on dockkit's neighbour choice. A page
+     * that is itself an unreadable preview is not remembered: its toolbar X
+     * never mounts, so returning to it after the child closes would strand the
+     * user on a tab they cannot close.
      * @param {string} sessionId - owning Session.
      */
     function rememberParentTab(sessionId) {
       try {
-        const active = ctxActiveTab()
+        const active = sidebarActiveTab()
         if (active === undefined) return
+        if (active.kind === 'text' && !documentHasDocumentClose(sessionId)) return
         const list = parentTabs.get(sessionId) || []
         if (list[list.length - 1] !== active.id) list.push(active.id)
         parentTabs.set(sessionId, list)
@@ -2211,32 +2258,50 @@ body:has([data-sidebar-right-session] [data-dockkit-tab][aria-selected='true'] .
     }
 
     /**
-     * The active tab id, or undefined when no surface is mounted.
-     * @returns {string | undefined} tab id.
+     * Whether the mounted right panel for one Session shows the document
+     * toolbar X. A text preview renders that X only once the file's Host path
+     * is known, so an unreadable file (gone, or its workspace unknown) has no
+     * toolbar and no X.
+     * @param {string} sessionId - owning Session.
+     * @returns {boolean} true when the toolbar X is on screen.
      */
-    function ctxActiveTab() {
-      const active = sidebarActiveTab()
-      return active === undefined ? undefined : active.id
+    function documentHasDocumentClose(sessionId) {
+      const panel = sidebarPanelFor(sessionId)
+      return panel !== undefined && panel.querySelector('.dsh-sidebar-document-close') !== null
     }
 
     // Bound by apply(): lets the helpers above stay free of a module-level ctx.
     let sidebarActiveTab = () => undefined
     let sidebarFocusTab = () => {}
+    let sidebarOpenTabIds = () => new Set()
 
     /**
-     * Pop the remembered parent and focus it after its child closes.
+     * Pop the remembered parent and focus it after its child closes. A parent
+     * that has been closed meanwhile is dropped, so the caller can fall back to
+     * this plugin's session page instead of leaving a neighbour — possibly an
+     * unreadable preview — on screen.
      * @param {string} sessionId - owning Session.
+     * @returns {boolean} true when a remembered parent was still open and is
+     *   now the active tab.
      */
     function restoreParentTab(sessionId) {
       const list = parentTabs.get(sessionId)
-      if (list === undefined || list.length === 0) return
+      if (list === undefined || list.length === 0) return false
       const parent = list.pop()
       if (list.length === 0) parentTabs.delete(sessionId)
+      let open = false
+      try {
+        open = sidebarOpenTabIds().has(parent)
+      } catch {
+        open = false
+      }
+      if (!open) return false
       try {
         sidebarFocusTab(parent)
       } catch {
-        // The parent may already be gone; the host's neighbour stays active.
+        return false
       }
+      return true
     }
 
     /* ------------------------------ width policy ------------------------------ */
@@ -2520,17 +2585,41 @@ body:has([data-sidebar-right-session] [data-dockkit-tab][aria-selected='true'] .
       const widthFace = rightbarWidthFace(ctx)
       sidebarActiveTab = () => ctx.sidebarRight.active()
       sidebarFocusTab = (tabId) => { ctx.sidebarRight.focus(tabId) }
+      sidebarOpenTabIds = () => {
+        const snapshot = ctx.sidebarRight.openTabs.getSnapshot()
+        const tabs = Array.isArray(snapshot)
+          ? snapshot
+          : (snapshot !== null && snapshot !== undefined && Array.isArray(snapshot.tabs) ? snapshot.tabs : [])
+        // The inventory exposes `tabId`; the layout record's own field is `id`.
+        return new Set(tabs.map(tab => tab.tabId ?? tab.id))
+      }
+      /**
+       * Close the active native page and settle on its parent. A page this
+       * plugin did not open (a conversation link, a native entry) has no
+       * remembered parent, so land on this plugin's session page instead of
+       * leaving the dockkit neighbour active: that neighbour can be an
+       * unreadable preview whose own X never mounted, which is exactly the
+       * page that would otherwise resurface after every neighbouring close.
+       * @param {string | undefined} sessionId - Session that owns the click.
+       * @returns {boolean} true when a native page was closed.
+       */
       const closeActiveNativeTab = (sessionId) => {
         const active = ctx.sidebarRight.active()
         if (active === undefined || active.kind === PAGE_KIND) return false
         try {
           ctx.sidebarRight.close(active.id)
-          const owner = sessionId ?? ctx.sidebarRight.mounted.getSnapshot()
-          if (owner !== undefined) restoreParentTab(owner)
-          return true
         } catch {
           return false
         }
+        const owner = sessionId ?? ctx.sidebarRight.mounted.getSnapshot()
+        if (owner === undefined || !restoreParentTab(owner)) {
+          try {
+            ctx.sidebarRight.openTab(PAGE_KIND)
+          } catch {
+            // No surface left to focus; the column state stands as it is.
+          }
+        }
+        return true
       }
 
       ctx.effect(() => installStyles(), 'dsh-sidebar: styles')
@@ -2690,6 +2779,7 @@ body:has([data-sidebar-right-session] [data-dockkit-tab][aria-selected='true'] .
         orderFileEntries,
         fileTone,
         isWideKind,
+        nativeCloseOverlayFor,
         narrowWidthFor,
         wideWidthFor,
         normalizeSectionState,

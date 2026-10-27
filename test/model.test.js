@@ -37,6 +37,7 @@ const {
   orderFileEntries,
   fileTone,
   isWideKind,
+  nativeCloseOverlayFor,
   narrowWidthFor,
   wideWidthFor,
   normalizeSectionState,
@@ -211,6 +212,22 @@ test('isWideKind widens preview-like native tabs only', () => {
   for (const kind of ['tasks', 'guide', 'unknown', '']) {
     assert.equal(isWideKind(kind), false, kind)
   }
+})
+
+test('nativeCloseOverlayFor covers native pages that have no visible X', () => {
+  // Terminal has no document toolbar: its floating X is the only close route.
+  assert.equal(nativeCloseOverlayFor('terminal', false), true)
+  // A readable file preview carries the document toolbar X, so the overlay stays away.
+  assert.equal(nativeCloseOverlayFor('text', true), false)
+  // A preview whose file cannot be read has no toolbar at all: the overlay is the
+  // only way to close the tab, which otherwise lingers in the open-tab record.
+  assert.equal(nativeCloseOverlayFor('text', false), true)
+  // Other native pages are closed by the header X.
+  for (const kind of ['files', 'browser', 'plan', 'subagent', 'changes-review', 'tasks', 'guide', 'unknown', '']) {
+    assert.equal(nativeCloseOverlayFor(kind, false), false, kind)
+  }
+  // No tab on screen.
+  assert.equal(nativeCloseOverlayFor(undefined, false), false)
 })
 
 test('column widths stay in their designed ranges', () => {
